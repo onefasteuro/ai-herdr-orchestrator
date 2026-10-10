@@ -109,6 +109,9 @@ def main(args):
         if pane(state, args[2]) is None:
             return fail("pane_not_found")
         state["panes"] = [p for p in state["panes"] if p["pane_id"] != args[2]]
+        # Like Herdr, a tab disappears with its last pane.
+        live = {p["tab_id"] for p in state["panes"]}
+        state["tabs"] = [t for t in state["tabs"] if t["tab_id"] in live]
         save(state)
         return out({"result": {}})
     if key == "pane read":

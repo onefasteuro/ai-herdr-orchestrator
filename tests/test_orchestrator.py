@@ -138,6 +138,11 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIn("Do the thing.", prompt)
         self.assertEqual(len(self.calls("pane", "close")), 1)
 
+    def test_agents_tab_recreated_after_last_pane_closes(self):
+        self.dispatch("reviewer", "--task", "T1")
+        self.dispatch("advisor", "--task", "T2")
+        self.assertEqual(len(self.calls("tab", "create")), 2)
+
     def test_second_dispatch_reuses_agents_tab(self):
         self.dispatch("reviewer", "--task", "T1", "--keep-pane")
         self.herdr_log.unlink()
@@ -267,6 +272,83 @@ class OrchestratorTest(unittest.TestCase):
         proc = self.run_orch("consult", "--role", "implementer", "x", check=False)
         self.assertIn("read-only role", proc.stderr)
 
+    # TASKS.md section
+
+    def tasks_md(self):
+        return (self.project / "TASKS.md").read_text()
+
+    def test_dispatch_creates_tasks_md_section(self):
+        self.dispatch("reviewer", "--task", "T1")
+        text = self.tasks_md()
+        self.assertTrue(text.startswith("# Tasks\n\n<!-- orchestrator:tasks:start -->"))
+        self.assertIn("| Task | Role | Agent | Status | Updated | Result |", text)
+        row = [l for l in text.splitlines() if l.startswith("| T1 ")][0]
+        self.assertIn("| reviewer | codex gpt-6-astra high | done |", row)
+        self.assertIn("[result](.orchestrator/tasks/T1/result.md)", row)
+        self.assertTrue(text.rstrip().endswith("<!-- orchestrator:tasks:end -->"))
+
+    def test_tasks_md_preserves_other_content(self):
+        (self.project / "TASKS.md").write_text("# Plan\n\n- [ ] T1 review\n")
+        self.dispatch("reviewer", "--task", "T1")
+        self.dispatch("advisor", "--task", "T2")
+        text = self.tasks_md()
+        self.assertTrue(text.startswith("# Plan\n\n- [ ] T1 review\n\n<!-- orchestrator:tasks:start -->"))
+        self.assertEqual(text.count("orchestrator:tasks:start"), 1)
+        self.assertIn("| T1 | reviewer |", text)
+        self.assertIn("| T2 | advisor |", text)
+
+    def test_tasks_md_section_replaced_in_place(self):
+        (self.project / "TASKS.md").write_text(
+            "# Plan\n\n<!-- orchestrator:tasks:start -->\nstale\n<!-- orchestrator:tasks:end -->\n\n## Notes\n\nkeep me\n")
+        self.dispatch("reviewer", "--task", "T1")
+        text = self.tasks_md()
+        self.assertNotIn("stale", text)
+        self.assertTrue(text.endswith("<!-- orchestrator:tasks:end -->\n\n## Notes\n\nkeep me\n"))
+        self.assertTrue(text.startswith("# Plan\n\n<!-- orchestrator:tasks:start -->"))
+
+    def test_tasks_md_tracks_running_then_done(self):
+        self.dispatch("implementer", "--task", "I1", "--no-wait")
+        row = [l for l in self.tasks_md().splitlines() if l.startswith("| I1 ")][0]
+        self.assertIn("| running |", row)
+        self.run_orch("wait", "I1")
+        row = [l for l in self.tasks_md().splitlines() if l.startswith("| I1 ")][0]
+        self.assertIn("| done |", row)
+
+    def test_tasks_md_failure_only_warns(self):
+        (self.project / "TASKS.md").mkdir()
+        proc, out = self.dispatch("reviewer", "--task", "T1")
+        self.assertEqual(out["status"], "done")
+        self.assertIn("warning: TASKS.md not updated", proc.stderr)
+
+    def test_dry_run_leaves_tasks_md_alone(self):
+        self.dispatch("reviewer", "--task", "T1", "--dry-run")
+        self.assertFalse((self.project / "TASKS.md").exists())
+
+    # Install
+
+    def test_install_links_skill_and_command(self):
+        home = self.tmp / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".pi" / "agent").mkdir(parents=True)
+        for _ in range(2):  # idempotent
+            proc = subprocess.run(["sh", str(REPO / "install.sh")], env=dict(self.env, HOME=str(home)),
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((home / ".agents/skills/orchestrator").resolve(), REPO / "skills/orchestrator")
+        self.assertEqual((home / ".claude/skills/orchestrator/SKILL.md").resolve(),
+                         REPO / "skills/orchestrator/SKILL.md")
+        self.assertEqual((home / ".pi/agent/skills/orchestrator/SKILL.md").resolve(),
+                         REPO / "skills/orchestrator/SKILL.md")
+        self.assertEqual((home / ".local/bin/orchestrator").resolve(), ORCH)
+
+    def test_install_refuses_to_replace_real_files(self):
+        home = self.tmp / "home"
+        (home / ".agents/skills/orchestrator").mkdir(parents=True)
+        proc = subprocess.run(["sh", str(REPO / "install.sh")], env=dict(self.env, HOME=str(home)),
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not a symlink", proc.stderr)
+
     # Start, status, close
 
     def test_start_dry_run_shows_root_command(self):
@@ -275,6 +357,8 @@ class OrchestratorTest(unittest.TestCase):
         line = [l for l in proc.stderr.splitlines() if l.startswith("+ claude")][0]
         for part in ("--model opus", "--effort xhigh", "--advisor fable", "--append-system-prompt"):
             self.assertIn(part, line)
+        self.assertIn("--append-system-prompt '# Orchestrator", line)
+        self.assertNotIn("name: orchestrator", proc.stderr)
         self.assertEqual(self.herdr_calls(), [])
 
     def test_start_with_codex_root(self):

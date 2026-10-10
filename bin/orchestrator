@@ -7,6 +7,7 @@ takes the right 40% of the caller's tab, and every subagent runs in one shared
 """
 
 import argparse
+import fcntl
 import json
 import os
 import secrets
@@ -23,6 +24,8 @@ STATE_DIR = ".orchestrator"
 AGENTS_TAB = "agents"
 TASKS_LABEL = "Tasks"
 TASKS_FILE = "TASKS.md"
+TASKS_START = "<!-- orchestrator:tasks:start -->"
+TASKS_END = "<!-- orchestrator:tasks:end -->"
 # The caller keeps this share of the width; the Tasks pane gets the rest (40%).
 TASKS_RATIO = "0.6"
 MAX_CONSULTS = 3
@@ -171,6 +174,16 @@ def role_text(name):
     return path.read_text() if path.exists() else ""
 
 
+def skill_body():
+    """Root agent instructions: the orchestrator skill without its frontmatter."""
+    text = (HOME / "skills" / "orchestrator" / "SKILL.md").read_text()
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            text = text[end + len("\n---\n"):]
+    return text.lstrip()
+
+
 # ------------------------------------------------------------ agent argv
 
 def agent_argv(role, cwd, prompt=None, result=None, instructions=None):
@@ -282,15 +295,14 @@ def agents_pane(h, workspace, cwd, env):
     """Return a fresh shell pane in the agents tab, creating the tab if needed."""
     tabs = h("tab", "list", "--workspace", workspace).get("result", {}).get("tabs", [])
     tab_id = next((t["tab_id"] for t in tabs if t.get("label") == AGENTS_TAB), None)
-    if tab_id is None:
+    panes = []
+    if tab_id is not None:
+        panes = [p for p in h("pane", "list", "--workspace", workspace)["result"]["panes"]
+                 if p.get("tab_id") == tab_id]
+    if not panes:
         res = h("tab", "create", "--workspace", workspace, "--cwd", cwd, "--label", AGENTS_TAB,
                 "--no-focus", *env_flags(env))
         return res["result"]["tab"]["tab_id"], res["result"]["root_pane"]["pane_id"]
-
-    panes = [p for p in h("pane", "list", "--workspace", workspace)["result"]["panes"]
-             if p.get("tab_id") == tab_id]
-    if not panes:
-        raise OrchestratorError(f"agents tab {tab_id} has no panes")
     rects = h("pane", "layout", "--pane", panes[0]["pane_id"])["result"]["layout"]["panes"]
     target = max(rects, key=lambda p: p["rect"]["width"] * p["rect"]["height"])
     rect = target["rect"]
@@ -316,10 +328,77 @@ def load_meta(root, task):
 
 
 def save_meta(meta):
+    meta["updated"] = now()
     path = Path(meta["dir"]) / "meta.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(meta, indent=2) + "\n")
     tmp.replace(path)
+    root = Path(meta["dir"]).parents[2]
+    try:
+        sync_tasks_file(root)
+    except (OSError, OrchestratorError) as exc:
+        # TASKS.md is a view; a failed update never changes the task outcome.
+        print(f"orchestrator: warning: {TASKS_FILE} not updated: {exc}", file=sys.stderr)
+
+
+def load_metas(root):
+    metas = []
+    for path in sorted((root / STATE_DIR / "tasks").glob("*/meta.json")):
+        try:
+            metas.append(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+    return sorted(metas, key=lambda m: m.get("started", ""))
+
+
+# ------------------------------------------------------------- TASKS.md
+
+def tasks_section(root):
+    lines = [TASKS_START, "## Dispatched tasks", "",
+             "| Task | Role | Agent | Status | Updated | Result |", "|---|---|---|---|---|---|"]
+    for m in load_metas(root):
+        agent = " ".join(str(m[k]) for k in ("kind", "model", "effort") if m.get(k))
+        updated = (m.get("updated") or m.get("started") or "")[5:16].replace("T", " ")
+        result = "-"
+        if Path(m["result"]).is_file():
+            result = f"[result]({os.path.relpath(m['result'], root)})"
+        lines.append(f"| {m['task']} | {m['role']} | {agent} | {m.get('status', '?')} | {updated} | {result} |")
+    lines.append(TASKS_END)
+    return "\n".join(lines) + "\n"
+
+
+def merge_tasks_section(text, section):
+    start, end = text.find(TASKS_START), text.find(TASKS_END)
+    if start != -1 and end > start:
+        after = text[end + len(TASKS_END):]
+        return text[:start] + section + (after[1:] if after.startswith("\n") else after)
+    base = text.rstrip("\n")
+    return (base + "\n\n" if base else "# Tasks\n\n") + section
+
+
+def sync_tasks_file(root):
+    """Rewrite the orchestrator-owned section of TASKS.md from the task records."""
+    path = (root / TASKS_FILE).resolve() if (root / TASKS_FILE).is_symlink() else root / TASKS_FILE
+    if path.exists() and not path.is_file():
+        raise OrchestratorError(f"{path} is not a regular file")
+    with open(root / STATE_DIR / "tasks.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for _ in range(3):
+            before = path.stat() if path.exists() else None
+            text = path.read_text() if before else ""
+            new = merge_tasks_section(text, tasks_section(root))
+            if new == text:
+                return
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(new)
+            after = path.stat() if path.exists() else None
+            # Replace only if nobody (e.g. the root agent) edited TASKS.md meanwhile.
+            if (before is None and after is None) or (
+                    before and after and (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size)):
+                tmp.replace(path)
+                return
+            tmp.unlink()
+    raise OrchestratorError(f"{path} kept changing during the update")
 
 
 def new_task_id(role, requested):
@@ -546,12 +625,7 @@ def cmd_wait(args):
 
 def cmd_status(args):
     root = checkout_root(Path.cwd())
-    metas = []
-    for path in sorted((root / STATE_DIR / "tasks").glob("*/meta.json")):
-        try:
-            metas.append(json.loads(path.read_text()))
-        except (OSError, ValueError):
-            continue
+    metas = load_metas(root)
     if args.json:
         print(json.dumps(metas, indent=2))
         return 0
@@ -657,7 +731,7 @@ def cmd_start(args):
     role = resolve_role(roles, "orchestrator", args)
     role.update(mode="interactive", access="write")
     cwd = Path.cwd().resolve()
-    argv = agent_argv(role, cwd, instructions=role_text("orchestrator")) + list(args.extra or [])
+    argv = agent_argv(role, cwd, instructions=skill_body()) + list(args.extra or [])
     if not args.no_tasks_pane:
         h = Herdr(args.dry_run)
         caller, workspace = herdr_context(args.dry_run)

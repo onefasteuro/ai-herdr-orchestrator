@@ -7,7 +7,15 @@ Run spec-driven development with one root agent and role-specific subagents (Cla
 - Every subagent runs in one shared `agents` tab, so the main tab stays quiet.
 - Results come back as files. Herdr state never proves that a task is done; the root agent decides.
 
-Requirements: Herdr (run inside a Herdr pane), Python 3.9+, `glow`, and whichever of `claude`, `codex` and `pi` your roles use. `~/.local/bin/orchestrator` is a symlink to `bin/orchestrator`.
+Requirements: Herdr (run inside a Herdr pane), Python 3.9+, `glow`, and whichever of `claude`, `codex` and `pi` your roles use.
+
+## Install
+
+```bash
+./install.sh
+```
+
+It links `~/.local/bin/orchestrator` to `bin/orchestrator` and the `orchestrator` skill into `~/.agents/skills` (read by Codex), `~/.claude/skills` and `~/.pi/agent/skills`. It is safe to rerun and never replaces a real file.
 
 ## Usage
 
@@ -33,7 +41,7 @@ Add `--dry-run` to `start`, `dispatch`, `consult` or `tasks-pane` to print the h
 
 ## Roles
 
-`roles.json` maps each role to a CLI, model, effort, mode and access level. Role instructions live in `roles/<role>.md`; `roles/common.md` applies to every subagent and `roles/orchestrator.md` is the root agent's system prompt.
+`roles.json` maps each role to a CLI, model, effort, mode and access level. Subagent instructions live in `roles/<role>.md`, and `roles/common.md` applies to every subagent. The root agent's instructions are the `orchestrator` skill (`skills/orchestrator/SKILL.md`): `orchestrator start` passes its body as the system prompt, and an agent started any other way finds it as a skill.
 
 | Role | CLI | Model | Effort | Mode | Access |
 |---|---|---|---|---|---|
@@ -52,6 +60,10 @@ Advice comes in three forms:
 - **Mid-turn, native:** Claude roles pass `--advisor <model>`, so Claude Code consults a stronger Claude model inside the same turn. The advisor must be at least as capable as the main model, and its advice is not readable.
 - **Mid-turn, any CLI:** write roles may run `orchestrator consult "<question>"` (at most 3 per task, read-only, cannot nest). It uses the `consultant` role by default, or `--role advisor` for Codex.
 - **Phase gate:** the root agent dispatches `advisor` on the spec and plan for a cross-family second opinion with a written record.
+
+## TASKS.md
+
+The Tasks pane renders `TASKS.md` at the checkout root. The root agent keeps its plan there, and `orchestrator` owns one section between `<!-- orchestrator:tasks:start -->` and `<!-- orchestrator:tasks:end -->`: a `Dispatched tasks` table (task, role, agent, status, last update, result link) rebuilt from the task records whenever a task record changes. It creates the file when missing, appends the section when absent, and leaves everything outside the markers unchanged. A failed update only prints a warning.
 
 ## How a dispatch runs
 
