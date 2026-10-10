@@ -128,6 +128,12 @@ def same_path(a, b):
 
 def state_dir(root, dry=False):
     path = root / STATE_DIR
+    # A cloned repo could ship these as symlinks; never write through them.
+    for p in (path, path / "tasks"):
+        if p.is_symlink():
+            raise OrchestratorError(f"{p} is a symlink; refusing to write through it")
+        if p.exists() and not p.is_dir():
+            raise OrchestratorError(f"{p} is not a directory")
     if not dry and not path.exists():
         path.mkdir(mode=0o700)
         (path / ".gitignore").write_text("*\n")
@@ -378,26 +384,40 @@ def merge_tasks_section(text, section):
 
 def sync_tasks_file(root):
     """Rewrite the orchestrator-owned section of TASKS.md from the task records."""
-    path = (root / TASKS_FILE).resolve() if (root / TASKS_FILE).is_symlink() else root / TASKS_FILE
+    path = root / TASKS_FILE
+    if path.is_symlink():
+        raise OrchestratorError(f"{path} is a symlink; not following it")
     if path.exists() and not path.is_file():
         raise OrchestratorError(f"{path} is not a regular file")
-    with open(root / STATE_DIR / "tasks.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # O_NOFOLLOW and no O_TRUNC: a planted symlink fails instead of being emptied.
+    lock_fd = os.open(root / STATE_DIR / "tasks.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         for _ in range(3):
             before = path.stat() if path.exists() else None
             text = path.read_text() if before else ""
             new = merge_tasks_section(text, tasks_section(root))
             if new == text:
                 return
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(new)
+            fd, tmp = tempfile.mkstemp(dir=root, prefix=f".{TASKS_FILE}.", suffix=".tmp")
+            with os.fdopen(fd, "w") as handle:
+                handle.write(new)
+            # mkstemp creates 0600; keep the existing mode, or the umask default for a new file.
+            if before:
+                os.chmod(tmp, before.st_mode & 0o777)
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                os.chmod(tmp, 0o666 & ~umask)
             after = path.stat() if path.exists() else None
             # Replace only if nobody (e.g. the root agent) edited TASKS.md meanwhile.
             if (before is None and after is None) or (
                     before and after and (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size)):
-                tmp.replace(path)
+                os.replace(tmp, path)
                 return
-            tmp.unlink()
+            os.unlink(tmp)
+    finally:
+        os.close(lock_fd)
     raise OrchestratorError(f"{path} kept changing during the update")
 
 
@@ -533,6 +553,7 @@ def cmd_dispatch(args):
     caller, workspace = herdr_context(args.dry_run)
     cwd = Path.cwd().resolve()
     root = checkout_root(cwd)
+    state_dir(root, dry=True)
     task = new_task_id(args.role, args.task)
     tdir = task_dir_for(root, task)
     if tdir.exists():

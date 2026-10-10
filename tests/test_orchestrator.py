@@ -286,6 +286,8 @@ class OrchestratorTest(unittest.TestCase):
         self.assertIn("| reviewer | codex gpt-6-astra high | done |", row)
         self.assertIn("[result](.orchestrator/tasks/T1/result.md)", row)
         self.assertTrue(text.rstrip().endswith("<!-- orchestrator:tasks:end -->"))
+        self.assertEqual((self.project / "TASKS.md").stat().st_mode & 0o044, 0o044)
+        self.assertEqual([p.name for p in self.project.glob(".TASKS.md.*")], [])
 
     def test_tasks_md_preserves_other_content(self):
         (self.project / "TASKS.md").write_text("# Plan\n\n- [ ] T1 review\n")
@@ -319,6 +321,36 @@ class OrchestratorTest(unittest.TestCase):
         proc, out = self.dispatch("reviewer", "--task", "T1")
         self.assertEqual(out["status"], "done")
         self.assertIn("warning: TASKS.md not updated", proc.stderr)
+
+    def test_symlinked_tasks_md_is_not_followed(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("precious\n")
+        (self.project / "TASKS.md").symlink_to(victim)
+        proc, out = self.dispatch("reviewer", "--task", "T1")
+        self.assertEqual(out["status"], "done")
+        self.assertIn("warning: TASKS.md not updated", proc.stderr)
+        self.assertEqual(victim.read_text(), "precious\n")
+        self.assertTrue((self.project / "TASKS.md").is_symlink())
+
+    def test_symlinked_lock_is_not_truncated(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("precious\n")
+        state = self.project / ".orchestrator"
+        state.mkdir()
+        (state / "tasks.lock").symlink_to(victim)
+        proc, out = self.dispatch("reviewer", "--task", "T1")
+        self.assertEqual(out["status"], "done")
+        self.assertEqual(victim.read_text(), "precious\n")
+
+    def test_symlinked_state_dir_refused(self):
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        (self.project / ".orchestrator").symlink_to(elsewhere)
+        proc, _ = self.dispatch("reviewer", "--task", "T1", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("is a symlink", proc.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(self.herdr_calls(), [])
 
     def test_dry_run_leaves_tasks_md_alone(self):
         self.dispatch("reviewer", "--task", "T1", "--dry-run")
