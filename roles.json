@@ -1,0 +1,60 @@
+{
+  "orchestrator": {
+    "kind": "claude",
+    "model": "opus",
+    "effort": "xhigh",
+    "advisor": "fable",
+    "summary": "Root agent: owns the spec, plan, TASKS.md, dispatch and acceptance"
+  },
+  "researcher": {
+    "kind": "claude",
+    "model": "sonnet",
+    "effort": "medium",
+    "advisor": "opus",
+    "mode": "headless",
+    "access": "read-only",
+    "web": true,
+    "summary": "Gathers facts from code and primary sources for the spec"
+  },
+  "advisor": {
+    "kind": "codex",
+    "model": "gpt-6-astra",
+    "effort": "xhigh",
+    "mode": "headless",
+    "access": "read-only",
+    "summary": "Cross-family second opinion at the spec and plan gates"
+  },
+  "implementer": {
+    "kind": "pi",
+    "model": "ollama-cloud/deepseek-v4.1-flash",
+    "effort": "high",
+    "mode": "interactive",
+    "access": "write",
+    "summary": "Implements one bounded brief inside its owned files"
+  },
+  "reviewer": {
+    "kind": "codex",
+    "model": "gpt-6-astra",
+    "effort": "high",
+    "mode": "headless",
+    "access": "read-only",
+    "summary": "Independent review of a candidate change against its brief"
+  },
+  "debugger": {
+    "kind": "claude",
+    "model": "opus",
+    "effort": "xhigh",
+    "advisor": "fable",
+    "mode": "interactive",
+    "access": "write",
+    "summary": "Reproduces and fixes a failure that blocked a task"
+  },
+  "consultant": {
+    "kind": "claude",
+    "model": "fable",
+    "effort": "high",
+    "mode": "headless",
+    "access": "read-only",
+    "summary": "Answers one mid-task question from `orchestrator consult`"
+  }
+}
